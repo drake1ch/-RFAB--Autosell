@@ -1,39 +1,23 @@
 #include "log.h"
 #include "hook.h"
 
-
-void OnDataLoaded()
+namespace
 {
-	Autosell::Install();
-}
-
-void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
-{
-	switch (a_msg->type) {
-	case SKSE::MessagingInterface::kDataLoaded:
-		OnDataLoaded();
-		break;
-	case SKSE::MessagingInterface::kPostLoad:
-		break;
-	case SKSE::MessagingInterface::kPreLoadGame:
-		break;
-	case SKSE::MessagingInterface::kPostLoadGame:
-        break;
-	case SKSE::MessagingInterface::kNewGame:
-		break;
+	void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
+	{
+		if (a_msg && a_msg->type == SKSE::MessagingInterface::kDataLoaded) {
+			Autosell::Install();
+		}
 	}
-}
+}  // namespace
 
-SKSEPluginLoad(const SKSE::LoadInterface *skse) {
-    SKSE::Init(skse);
+SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
+{
+	SKSE::Init(a_skse);
 	SetupLog();
-
-
-    auto messaging = SKSE::GetMessagingInterface();
+	auto messaging = SKSE::GetMessagingInterface();
 	if (!messaging->RegisterListener("SKSE", MessageHandler)) {
 		return false;
 	}
-
-	
-    return true;
+	return true;
 }

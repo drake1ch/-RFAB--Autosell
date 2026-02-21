@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 #include "RE/B/BSTCreateFactoryManager.h"
 #include "RE/E/ExtraCount.h"
@@ -29,6 +30,8 @@ namespace
 	constexpr auto* kSoundGoldUp = "ITMGoldUp";
 	std::atomic_bool g_sellQueued{ false };
 	std::atomic_bool g_confirmOpen{ false };
+	std::uintptr_t   g_hintMenuAddr{ 0 };
+	bool             g_hintInjected{ false };
 	struct SaleAction
 	{
 		RE::TESBoundObject* object{ nullptr };
@@ -58,7 +61,11 @@ namespace
 			return true;
 		}
 		const char* editorID = a_object->GetFormEditorID();
-		return editorID && std::string_view{ editorID } == "Unarmed";
+		if (!editorID) {
+			return false;
+		}
+		const auto id = std::string_view{ editorID };
+		return id == "Unarmed" || id == "RFAB_Skin_Leather_AdventurerBackPack" || id == "RFAB_Lampa";
 	}
 	[[nodiscard]] bool IsStackBlocked(RE::ExtraDataList* a_xList)
 	{
@@ -115,10 +122,10 @@ namespace
 		}
 		return std::nullopt;
 	}
-	[[nodiscard]] std::optional<std::int32_t> GetMenuUnitPrice(const RE::GFxValue& a_itemObj)
+	[[nodiscard]] std::int32_t GetMenuUnitPrice(const RE::GFxValue& a_itemObj)
 	{
 		if (!a_itemObj.IsObject() && !a_itemObj.IsDisplayObject()) {
-			return std::nullopt;
+			return 0;
 		}
 
 		RE::GFxValue field;
@@ -127,23 +134,7 @@ namespace
 				return std::max<std::int32_t>(0, *parsed);
 			}
 		}
-		return std::nullopt;		
-	}
-	void RefreshBarterUI(RE::TESObjectREFR* a_player, RE::TESObjectREFR* a_merchant)
-	{
-		if (const auto ui = RE::UI::GetSingleton(); ui) {
-			if (auto menu = ui->GetMenu<RE::BarterMenu>(); menu) {
-				if (auto* itemList = menu->GetRuntimeData().itemList; itemList) {
-					if (a_player) {
-						itemList->Update(a_player);
-					}
-					if (a_merchant) {
-						itemList->Update(a_merchant);
-					}
-					itemList->Update();
-				}
-			}
-		}
+		return 0;
 	}
 	[[nodiscard]] std::vector<SaleAction> BuildActions(RE::BarterMenu& a_menu)
 	{
@@ -153,6 +144,7 @@ namespace
 			return actions;
 		}
 		const auto merchantHandle = RE::BarterMenu::GetTargetRefHandle();
+		std::unordered_set<RE::InventoryEntryData*> seenEntries{};
 		actions.reserve(itemList->items.size());
 		for (auto* item : itemList->items) {
 			if (!item || (merchantHandle != 0 && item->data.owner == merchantHandle)) {
@@ -162,14 +154,14 @@ namespace
 			if (!entry) {
 				continue;
 			}
+			if (!seenEntries.insert(entry).second) {
+				continue;
+			}
 			auto* object = entry->GetObject();
 			if (IsExcludedObject(object)) {
 				continue;
 			}
 			const auto unitPrice = GetMenuUnitPrice(item->obj);
-			if (!unitPrice) {
-				continue;
-			}
 			const auto totalCount = static_cast<std::int32_t>(item->data.GetCount());
 			if (totalCount <= 0) {
 				continue;
@@ -178,12 +170,16 @@ namespace
 				if (entry->IsFavorited() || entry->IsWorn() || entry->IsQuestObject()) {
 					continue;
 				}
-				actions.push_back(SaleAction{ object, nullptr, totalCount, *unitPrice });
+				actions.push_back(SaleAction{ object, nullptr, totalCount, unitPrice });
 				continue;
 			}
+			std::unordered_set<RE::ExtraDataList*> seenStacks{};
 			std::int32_t accounted = 0;
 			for (auto* xList : *entry->extraLists) {
 				if (!xList) {
+					continue;
+				}
+				if (!seenStacks.insert(xList).second) {
 					continue;
 				}
 				const auto count = GetStackCount(xList);
@@ -191,11 +187,11 @@ namespace
 				if (count <= 0 || IsStackBlocked(xList)) {
 					continue;
 				}
-				actions.push_back(SaleAction{ object, xList, count, *unitPrice });
+				actions.push_back(SaleAction{ object, xList, count, unitPrice });
 			}
 			const auto remaining = std::max<std::int32_t>(0, totalCount - accounted);
 			if (remaining > 0) {
-				actions.push_back(SaleAction{ object, nullptr, remaining, *unitPrice });
+				actions.push_back(SaleAction{ object, nullptr, remaining, unitPrice });
 			}
 		}
 		return actions;
@@ -209,7 +205,48 @@ namespace
 			RE::DebugNotification(kMsgNothing);
 		}
 	}
-	void RunSellActions(std::shared_ptr<const std::vector<SaleAction>> a_actions)
+	void QueueBarterRefresh(const SellResult& a_result)
+	{
+		auto* task = SKSE::GetTaskInterface();
+		if (!task) {
+			NotifySellResult(a_result);
+			g_sellQueued.store(false);
+			return;
+		}
+		task->AddUITask([a_result]() {
+			if (!IsBarterOpen()) {
+				NotifySellResult(a_result);
+				g_sellQueued.store(false);
+				return;
+			}
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				NotifySellResult(a_result);
+				g_sellQueued.store(false);
+				return;
+			}
+			auto menu = ui->GetMenu<RE::BarterMenu>();
+			if (!menu) {
+				NotifySellResult(a_result);
+				g_sellQueued.store(false);
+				return;
+			}
+			auto* itemList = menu->GetRuntimeData().itemList;
+			if (!itemList || !itemList->view.get()) {
+				NotifySellResult(a_result);
+				g_sellQueued.store(false);
+				return;
+			}
+			if (auto* player = RE::PlayerCharacter::GetSingleton(); player) {
+				itemList->Update(player);
+			} else {
+				itemList->Update();
+			}
+			NotifySellResult(a_result);
+			g_sellQueued.store(false);
+		});
+	}
+	void RunSellActions(const std::vector<SaleAction>& a_actions)
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) {
@@ -228,7 +265,7 @@ namespace
 			return;
 		}
 		SellResult result{};
-		for (const auto& action : *a_actions) {
+		for (const auto& action : a_actions) {
 			if (!action.object || action.count <= 0) {
 				continue;
 			}
@@ -236,34 +273,75 @@ namespace
 			if (available <= 0) {
 				continue;
 			}
-			const auto requested = std::min(available, action.count);
-			player->RemoveItem(action.object, requested, RE::ITEM_REMOVE_REASON::kSelling, action.xList, merchantContainer);
-			result.sold += requested;
-			if (action.unitPrice <= 0) {
+			auto requested = std::min(available, action.count);
+			if (requested <= 0) {
 				continue;
 			}
-			const auto gold64 = static_cast<std::int64_t>(requested) * static_cast<std::int64_t>(action.unitPrice);
-			const auto goldDelta = static_cast<std::int32_t>(std::clamp<std::int64_t>(
-				gold64, 0, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())));
-			if (goldDelta > 0) {
-				player->AddObjectToContainer(gold, nullptr, goldDelta, nullptr);
+			RE::ExtraDataList* removeList = nullptr;
+			auto inventory = player->GetInventory([&action](RE::TESBoundObject& a_item) {
+				return std::addressof(a_item) == action.object;
+			});
+			auto it = inventory.find(action.object);
+			if (it == inventory.end()) {
+				continue;
 			}
-		}
-		if (auto* task = SKSE::GetTaskInterface(); task) {
-			task->AddUITask([result]() {
-				auto* localPlayer = RE::PlayerCharacter::GetSingleton();
-				RE::NiPointer<RE::Actor> localMerchant;
-				if (localPlayer && RE::Actor::LookupByHandle(RE::BarterMenu::GetTargetRefHandle(), localMerchant) && localMerchant) {
-					if (auto* merchantContainer = GetMerchantContainer(localMerchant.get()); merchantContainer) {
-						RefreshBarterUI(localPlayer, merchantContainer);
+			auto* entry = it->second.second.get();
+			if (!entry) {
+				continue;
+			}
+			if (action.xList) {
+				if (!entry->extraLists) {
+					continue;
+				}
+				for (auto* xList : *entry->extraLists) {
+					if (!xList || xList != action.xList) {
+						continue;
+					}
+					const auto count = GetStackCount(xList);
+					if (count <= 0 || IsStackBlocked(xList)) {
+						continue;
+					}
+					removeList = xList;
+					requested = std::min(requested, count);
+					break;
+				}
+				if (!removeList) {
+					continue;
+				}
+			} else {
+				if (entry->IsFavorited() || entry->IsWorn() || entry->IsQuestObject()) {
+					continue;
+				}
+				std::int32_t genericCount = std::max<std::int32_t>(0, it->second.first);
+				if (entry->extraLists) {
+					for (auto* xList : *entry->extraLists) {
+						if (!xList) {
+							continue;
+						}
+						genericCount -= std::max<std::int32_t>(0, GetStackCount(xList));
 					}
 				}
-				NotifySellResult(result);
-				g_sellQueued.store(false);
-			});
-		} else {
-			g_sellQueued.store(false);
+				genericCount = std::max<std::int32_t>(0, genericCount);
+				if (genericCount <= 0) {
+					continue;
+				}
+				requested = std::min(requested, genericCount);
+			}
+			if (requested <= 0) {
+				continue;
+			}
+			player->RemoveItem(action.object, requested, RE::ITEM_REMOVE_REASON::kSelling, removeList, merchantContainer);
+			result.sold += requested;
+			if (action.unitPrice > 0) {
+				const auto gold64 = static_cast<std::int64_t>(requested) * static_cast<std::int64_t>(action.unitPrice);
+				const auto goldDelta = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+					gold64, 0, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())));
+				if (goldDelta > 0) {
+					player->AddObjectToContainer(gold, nullptr, goldDelta, nullptr);
+				}
+			}
 		}
+		QueueBarterRefresh(result);
 	}
 	void StartAutosellFromUI()
 	{
@@ -275,8 +353,7 @@ namespace
 			return;
 		}
 		auto* ui = RE::UI::GetSingleton();
-		auto* task = SKSE::GetTaskInterface();
-		if (!ui || !task) {
+		if (!ui) {
 			g_sellQueued.store(false);
 			return;
 		}
@@ -285,15 +362,13 @@ namespace
 			g_sellQueued.store(false);
 			return;
 		}
-		auto actions = std::make_shared<std::vector<SaleAction>>(BuildActions(*menu));
-		if (actions->empty()) {
+		auto actions = BuildActions(*menu);
+		if (actions.empty()) {
 			RE::DebugNotification(kMsgNothing);
 			g_sellQueued.store(false);
 			return;
 		}
-		task->AddTask([actions]() {
-			RunSellActions(actions);
-		});
+		RunSellActions(actions);
 	}
 	class SellConfirmCallback final : public RE::IMessageBoxCallback
 	{
@@ -368,6 +443,9 @@ namespace
 		if (!rt.itemList || !rt.itemList->view.get()) {
 			return false;
 		}
+		if (!rt.root.IsObject() && !rt.root.IsDisplayObject()) {
+			return false;
+		}
 		if (rt.root.GetMember("navPanel", std::addressof(a_panel))) {
 			return a_panel.IsObject() || a_panel.IsDisplayObject();
 		}
@@ -385,6 +463,12 @@ namespace
 	void EnsureAutosellHint(RE::BarterMenu* a_menu)
 	{
 		if (!a_menu) {
+			g_hintInjected = false;
+			g_hintMenuAddr = 0;
+			return;
+		}
+		const auto menuAddr = reinterpret_cast<std::uintptr_t>(a_menu);
+		if (g_hintInjected && g_hintMenuAddr == menuAddr) {
 			return;
 		}
 		RE::GFxValue panel;
@@ -404,6 +488,8 @@ namespace
 			if ((btn.GetMember("label", std::addressof(label)) || btn.GetMember("_label", std::addressof(label))) && label.IsString()) {
 				const char* text = label.GetString();
 				if (text && std::string_view{ text } == kHintSellAll) {
+					g_hintInjected = true;
+					g_hintMenuAddr = menuAddr;
 					return;
 				}
 			}
@@ -426,27 +512,23 @@ namespace
 		panel.Invoke("addButton", std::addressof(result), args, 1);
 		RE::GFxValue upd[1]{ RE::GFxValue(true) };
 		panel.Invoke("updateButtons", std::addressof(result), upd, 1);
+		g_hintInjected = true;
+		g_hintMenuAddr = menuAddr;
 	}
 	struct BarterMenuHooks
 	{
-		static RE::UI_MESSAGE_RESULTS ProcessMessage_Thunk(RE::BarterMenu* a_this, RE::UIMessage& a_message)
-		{
-			const auto result = ProcessMessage_Original(a_this, a_message);
-			EnsureAutosellHint(a_this);
-			return result;
-		}
 		static void AdvanceMovie_Thunk(RE::BarterMenu* a_this, float a_interval, std::uint32_t a_currentTime)
 		{
-			AdvanceMovie_Original(a_this, a_interval, a_currentTime);
+			if (AdvanceMovie_Original.address() != 0) {
+				AdvanceMovie_Original(a_this, a_interval, a_currentTime);
+			}
 			EnsureAutosellHint(a_this);
 		}
 		static void Install()
 		{
 			REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE_BarterMenu[0] };
-			ProcessMessage_Original = vtbl.write_vfunc(0x4, ProcessMessage_Thunk);
 			AdvanceMovie_Original = vtbl.write_vfunc(0x5, AdvanceMovie_Thunk);
 		}
-		static inline REL::Relocation<decltype(ProcessMessage_Thunk)> ProcessMessage_Original;
 		static inline REL::Relocation<decltype(AdvanceMovie_Thunk)> AdvanceMovie_Original;
 	};
 	class AutosellMenuEventHandler final : public RE::MenuEventHandler
